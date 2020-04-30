@@ -15,27 +15,35 @@
  */
 package com.google.android.exoplayer2.source;
 
+import androidx.annotation.Nullable;
+import com.google.android.exoplayer2.AbstractConcatenatedTimeline;
 import com.google.android.exoplayer2.C;
 import com.google.android.exoplayer2.ExoPlayer;
+import com.google.android.exoplayer2.Player;
 import com.google.android.exoplayer2.Timeline;
+import com.google.android.exoplayer2.source.ShuffleOrder.UnshuffledShuffleOrder;
 import com.google.android.exoplayer2.upstream.Allocator;
+import com.google.android.exoplayer2.upstream.TransferListener;
 import com.google.android.exoplayer2.util.Assertions;
-import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
 /**
- * Loops a {@link MediaSource}.
+ * Loops a {@link MediaSource} a specified number of times.
+ *
+ * <p>Note: To loop a {@link MediaSource} indefinitely, it is usually better to use {@link
+ * ExoPlayer#setRepeatMode(int)} instead of this class.
  */
-public final class LoopingMediaSource implements MediaSource {
+public final class LoopingMediaSource extends CompositeMediaSource<Void> {
 
-  private static final String TAG = "LoopingMediaSource";
-
-  private final MediaSource childSource;
+  private final MaskingMediaSource maskingMediaSource;
   private final int loopCount;
-
-  private int childPeriodCount;
+  private final Map<MediaPeriodId, MediaPeriodId> childMediaPeriodIdToMediaPeriodId;
+  private final Map<MediaPeriod, MediaPeriodId> mediaPeriodToChildMediaPeriodId;
 
   /**
-   * Loops the provided source indefinitely.
+   * Loops the provided source indefinitely. Note that it is usually better to use
+   * {@link ExoPlayer#setRepeatMode(int)}.
    *
    * @param childSource The {@link MediaSource} to loop.
    */
@@ -51,43 +59,77 @@ public final class LoopingMediaSource implements MediaSource {
    */
   public LoopingMediaSource(MediaSource childSource, int loopCount) {
     Assertions.checkArgument(loopCount > 0);
-    this.childSource = childSource;
+    this.maskingMediaSource = new MaskingMediaSource(childSource, /* useLazyPreparation= */ false);
     this.loopCount = loopCount;
+    childMediaPeriodIdToMediaPeriodId = new HashMap<>();
+    mediaPeriodToChildMediaPeriodId = new HashMap<>();
   }
 
   @Override
-  public void prepareSource(ExoPlayer player, boolean isTopLevelSource, final Listener listener) {
-    childSource.prepareSource(player, false, new Listener() {
-      @Override
-      public void onSourceInfoRefreshed(Timeline timeline, Object manifest) {
-        childPeriodCount = timeline.getPeriodCount();
-        Timeline loopingTimeline = loopCount != Integer.MAX_VALUE
-            ? new LoopingTimeline(timeline, loopCount) : new InfinitelyLoopingTimeline(timeline);
-        listener.onSourceInfoRefreshed(loopingTimeline, manifest);
-      }
-    });
+  @Nullable
+  public Object getTag() {
+    return maskingMediaSource.getTag();
   }
 
   @Override
-  public void maybeThrowSourceInfoRefreshError() throws IOException {
-    childSource.maybeThrowSourceInfoRefreshError();
-  }
-
-  @Override
-  public MediaPeriod createPeriod(int index, Allocator allocator, long positionUs) {
+  @Nullable
+  public Timeline getInitialTimeline() {
     return loopCount != Integer.MAX_VALUE
-        ? childSource.createPeriod(index % childPeriodCount, allocator, positionUs)
-        : childSource.createPeriod(index, allocator, positionUs);
+        ? new LoopingTimeline(maskingMediaSource.getTimeline(), loopCount)
+        : new InfinitelyLoopingTimeline(maskingMediaSource.getTimeline());
+  }
+
+  @Override
+  public boolean isSingleWindow() {
+    return false;
+  }
+
+  @Override
+  protected void prepareSourceInternal(@Nullable TransferListener mediaTransferListener) {
+    super.prepareSourceInternal(mediaTransferListener);
+    prepareChildSource(/* id= */ null, maskingMediaSource);
+  }
+
+  @Override
+  public MediaPeriod createPeriod(MediaPeriodId id, Allocator allocator, long startPositionUs) {
+    if (loopCount == Integer.MAX_VALUE) {
+      return maskingMediaSource.createPeriod(id, allocator, startPositionUs);
+    }
+    Object childPeriodUid = LoopingTimeline.getChildPeriodUidFromConcatenatedUid(id.periodUid);
+    MediaPeriodId childMediaPeriodId = id.copyWithPeriodUid(childPeriodUid);
+    childMediaPeriodIdToMediaPeriodId.put(childMediaPeriodId, id);
+    MediaPeriod mediaPeriod =
+        maskingMediaSource.createPeriod(childMediaPeriodId, allocator, startPositionUs);
+    mediaPeriodToChildMediaPeriodId.put(mediaPeriod, childMediaPeriodId);
+    return mediaPeriod;
   }
 
   @Override
   public void releasePeriod(MediaPeriod mediaPeriod) {
-    childSource.releasePeriod(mediaPeriod);
+    maskingMediaSource.releasePeriod(mediaPeriod);
+    @Nullable
+    MediaPeriodId childMediaPeriodId = mediaPeriodToChildMediaPeriodId.remove(mediaPeriod);
+    if (childMediaPeriodId != null) {
+      childMediaPeriodIdToMediaPeriodId.remove(childMediaPeriodId);
+    }
   }
 
   @Override
-  public void releaseSource() {
-    childSource.releaseSource();
+  protected void onChildSourceInfoRefreshed(Void id, MediaSource mediaSource, Timeline timeline) {
+    Timeline loopingTimeline =
+        loopCount != Integer.MAX_VALUE
+            ? new LoopingTimeline(timeline, loopCount)
+            : new InfinitelyLoopingTimeline(timeline);
+    refreshSourceInfo(loopingTimeline);
+  }
+
+  @Override
+  @Nullable
+  protected MediaPeriodId getMediaPeriodIdForChildMediaPeriodId(
+      Void id, MediaPeriodId mediaPeriodId) {
+    return loopCount != Integer.MAX_VALUE
+        ? childMediaPeriodIdToMediaPeriodId.get(mediaPeriodId)
+        : mediaPeriodId;
   }
 
   private static final class LoopingTimeline extends AbstractConcatenatedTimeline {
@@ -98,12 +140,15 @@ public final class LoopingMediaSource implements MediaSource {
     private final int loopCount;
 
     public LoopingTimeline(Timeline childTimeline, int loopCount) {
+      super(/* isAtomic= */ false, new UnshuffledShuffleOrder(loopCount));
       this.childTimeline = childTimeline;
       childPeriodCount = childTimeline.getPeriodCount();
       childWindowCount = childTimeline.getWindowCount();
       this.loopCount = loopCount;
-      Assertions.checkState(loopCount <= Integer.MAX_VALUE / childPeriodCount,
-          "LoopingMediaSource contains too many periods");
+      if (childPeriodCount > 0) {
+        Assertions.checkState(loopCount <= Integer.MAX_VALUE / childPeriodCount,
+            "LoopingMediaSource contains too many periods");
+      }
     }
 
     @Override
@@ -117,81 +162,69 @@ public final class LoopingMediaSource implements MediaSource {
     }
 
     @Override
-    protected Timeline getChild(int childIndex) {
-      return childTimeline;
-    }
-
-    @Override
-    protected int getChildCount() {
-      return loopCount;
-    }
-
-    @Override
-    protected int getChildIndexForPeriod(int periodIndex) {
+    protected int getChildIndexByPeriodIndex(int periodIndex) {
       return periodIndex / childPeriodCount;
     }
 
     @Override
-    protected int getFirstPeriodIndexInChild(int childIndex) {
-      return childIndex * childPeriodCount;
-    }
-
-    @Override
-    protected int getChildIndexForWindow(int windowIndex) {
+    protected int getChildIndexByWindowIndex(int windowIndex) {
       return windowIndex / childWindowCount;
     }
 
     @Override
-    protected int getFirstWindowIndexInChild(int childIndex) {
+    protected int getChildIndexByChildUid(Object childUid) {
+      if (!(childUid instanceof Integer)) {
+        return C.INDEX_UNSET;
+      }
+      return (Integer) childUid;
+    }
+
+    @Override
+    protected Timeline getTimelineByChildIndex(int childIndex) {
+      return childTimeline;
+    }
+
+    @Override
+    protected int getFirstPeriodIndexByChildIndex(int childIndex) {
+      return childIndex * childPeriodCount;
+    }
+
+    @Override
+    protected int getFirstWindowIndexByChildIndex(int childIndex) {
       return childIndex * childWindowCount;
     }
+
+    @Override
+    protected Object getChildUidByChildIndex(int childIndex) {
+      return childIndex;
+    }
+
   }
 
-  private static final class InfinitelyLoopingTimeline extends Timeline {
+  private static final class InfinitelyLoopingTimeline extends ForwardingTimeline {
 
-    private final Timeline childTimeline;
-
-    public InfinitelyLoopingTimeline(Timeline childTimeline) {
-      this.childTimeline = childTimeline;
+    public InfinitelyLoopingTimeline(Timeline timeline) {
+      super(timeline);
     }
 
     @Override
-    public int getWindowCount() {
-      return childTimeline.getWindowCount();
+    public int getNextWindowIndex(int windowIndex, @Player.RepeatMode int repeatMode,
+        boolean shuffleModeEnabled) {
+      int childNextWindowIndex = timeline.getNextWindowIndex(windowIndex, repeatMode,
+          shuffleModeEnabled);
+      return childNextWindowIndex == C.INDEX_UNSET ? getFirstWindowIndex(shuffleModeEnabled)
+          : childNextWindowIndex;
     }
 
     @Override
-    public int getNextWindowIndex(int windowIndex, @ExoPlayer.RepeatMode int repeatMode) {
-      int childNextWindowIndex = childTimeline.getNextWindowIndex(windowIndex, repeatMode);
-      return childNextWindowIndex == C.INDEX_UNSET ? 0 : childNextWindowIndex;
-    }
-
-    @Override
-    public int getPreviousWindowIndex(int windowIndex, @ExoPlayer.RepeatMode int repeatMode) {
-      int childPreviousWindowIndex = childTimeline.getPreviousWindowIndex(windowIndex, repeatMode);
-      return childPreviousWindowIndex == C.INDEX_UNSET ? getWindowCount() - 1
+    public int getPreviousWindowIndex(int windowIndex, @Player.RepeatMode int repeatMode,
+        boolean shuffleModeEnabled) {
+      int childPreviousWindowIndex = timeline.getPreviousWindowIndex(windowIndex, repeatMode,
+          shuffleModeEnabled);
+      return childPreviousWindowIndex == C.INDEX_UNSET ? getLastWindowIndex(shuffleModeEnabled)
           : childPreviousWindowIndex;
     }
 
-    @Override
-    public Window getWindow(int windowIndex, Window window, boolean setIds,
-        long defaultPositionProjectionUs) {
-      return childTimeline.getWindow(windowIndex, window, setIds, defaultPositionProjectionUs);
-    }
-
-    @Override
-    public int getPeriodCount() {
-      return childTimeline.getPeriodCount();
-    }
-
-    @Override
-    public Period getPeriod(int periodIndex, Period period, boolean setIds) {
-      return childTimeline.getPeriod(periodIndex, period, setIds);
-    }
-
-    @Override
-    public int getIndexOfPeriod(Object uid) {
-      return childTimeline.getIndexOfPeriod(uid);
-    }
   }
+
 }
